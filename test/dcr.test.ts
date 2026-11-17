@@ -1,0 +1,508 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import * as client from '../src/index.js'
+import * as oauth from 'oauth4webapi'
+import * as undici from 'undici'
+import * as jose from 'jose'
+
+test('DCR preserves clock settings across DPoP nonce retries', async () => {
+  const issuer = new URL('https://op.example.com')
+  const keyPair = await client.randomDPoPKeyPair('ES256')
+  let registrationRequests = 0
+  let authenticated = false
+
+  const config = await client.dynamicClientRegistration(
+    issuer,
+    {
+      [client.clockSkew]: 120,
+      [client.clockTolerance]: 0,
+    },
+    (server, metadata, body, headers) => {
+      assert.strictEqual(metadata[client.clockSkew], 120)
+      assert.strictEqual(metadata[client.clockTolerance], 0)
+      authenticated = true
+      return client.None()(server, metadata, body, headers)
+    },
+    {
+      DPoP: oauth.DPoP({}, keyPair),
+      [client.customFetch]: async (url, options) => {
+        switch (new URL(url).pathname) {
+          case '/.well-known/openid-configuration':
+            return Response.json({
+              issuer: issuer.href,
+              registration_endpoint: `${issuer.origin}/reg`,
+              token_endpoint: `${issuer.origin}/token`,
+            })
+          case '/reg':
+            assert.deepStrictEqual(JSON.parse(options.body as string), {})
+            if (++registrationRequests === 1) {
+              return Response.json(
+                {},
+                {
+                  status: 400,
+                  headers: {
+                    'dpop-nonce': 'server-nonce',
+                    'www-authenticate': 'DPoP error="use_dpop_nonce"',
+                  },
+                },
+              )
+            }
+            assert.strictEqual(
+              jose.decodeJwt(options.headers.dpop).nonce,
+              'server-nonce',
+            )
+            return Response.json({ client_id: 'client' }, { status: 201 })
+          case '/token':
+            return Response.json({
+              access_token: 'access_token',
+              token_type: 'bearer',
+            })
+          default:
+            throw new Error(`unexpected request to ${url}`)
+        }
+      },
+    },
+  )
+
+  await client.clientCredentialsGrant(config)
+  assert.strictEqual(registrationRequests, 2)
+  assert.strictEqual(authenticated, true)
+})
+
+test('dpop may be used with DCR w/ initial access token', async () => {
+  let agent = new undici.MockAgent()
+  agent.disableNetConnect()
+
+  const issuer = new URL('https://op.example.com')
+  const kp = await client.randomDPoPKeyPair('ES256')
+
+  const mockAgent = agent.get(issuer.origin)
+
+  mockAgent
+    .intercept({
+      method: 'GET',
+      path: '/.well-known/openid-configuration',
+    })
+    .reply(200, {
+      issuer: issuer.href,
+      registration_endpoint: `${issuer.origin}/reg`,
+    })
+
+  mockAgent
+    .intercept({
+      method: 'POST',
+      path: '/reg',
+      headers({ dpop, authorization }) {
+        return typeof dpop === 'string' && authorization === 'DPoP token'
+      },
+    })
+    .reply(
+      400,
+      {},
+      {
+        headers: {
+          'dpop-nonce': 'use this',
+          'www-authenticate': 'dpop error="use_dpop_nonce"',
+        },
+      },
+    )
+
+  mockAgent
+    .intercept({
+      method: 'POST',
+      path: '/reg',
+      headers({ dpop, authorization }) {
+        const { nonce } = jose.decodeJwt(dpop)
+        return nonce === 'use this' && authorization === 'DPoP token'
+      },
+    })
+    .reply(201, {
+      client_id: 'foo',
+    })
+
+  await client.dynamicClientRegistration(issuer, {}, undefined, {
+    initialAccessToken: 'token',
+    DPoP: oauth.DPoP({}, kp),
+    // @ts-ignore
+    [client.customFetch](url, options) {
+      return undici.fetch(url, { ...options, dispatcher: agent })
+    },
+  })
+
+  assert.doesNotThrow(() => agent.assertNoPendingInterceptors())
+})
+
+test('dpop may be used with DCR w/o initial access token', async () => {
+  let agent = new undici.MockAgent()
+  agent.disableNetConnect()
+
+  const issuer = new URL('https://op.example.com')
+  const kp = await client.randomDPoPKeyPair('ES256')
+
+  const mockAgent = agent.get(issuer.origin)
+
+  mockAgent
+    .intercept({
+      method: 'GET',
+      path: '/.well-known/openid-configuration',
+    })
+    .reply(200, {
+      issuer: issuer.href,
+      registration_endpoint: `${issuer.origin}/reg`,
+      token_endpoint: `${issuer.origin}/token`,
+    })
+
+  mockAgent
+    .intercept({
+      method: 'POST',
+      path: '/reg',
+      headers({ dpop, authorization }) {
+        return typeof dpop === 'string' && authorization === undefined
+      },
+    })
+    .reply(
+      400,
+      {},
+      {
+        headers: {
+          'dpop-nonce': 'use this',
+          'www-authenticate': 'dpop error="use_dpop_nonce"',
+        },
+      },
+    )
+
+  mockAgent
+    .intercept({
+      method: 'POST',
+      path: '/reg',
+      headers({ dpop, authorization }) {
+        const { nonce } = jose.decodeJwt(dpop)
+        return nonce === 'use this' && authorization === undefined
+      },
+    })
+    .reply(201, {
+      client_id: 'foo',
+      client_secret: 'bar',
+      client_secret_expires_at: 0,
+    })
+
+  await client.dynamicClientRegistration(issuer, {}, undefined, {
+    DPoP: oauth.DPoP({}, kp),
+    // @ts-ignore
+    [client.customFetch](url, options) {
+      return undici.fetch(url, { ...options, dispatcher: agent })
+    },
+  })
+
+  assert.doesNotThrow(() => agent.assertNoPendingInterceptors())
+})
+
+test('DCR uses client_secret_post by default when client_secret was returned', async () => {
+  let agent = new undici.MockAgent()
+  agent.disableNetConnect()
+
+  const issuer = new URL('https://op.example.com')
+
+  const mockAgent = agent.get(issuer.origin)
+
+  mockAgent
+    .intercept({
+      method: 'GET',
+      path: '/.well-known/openid-configuration',
+    })
+    .reply(200, {
+      issuer: issuer.href,
+      registration_endpoint: `${issuer.origin}/reg`,
+      token_endpoint: `${issuer.origin}/token`,
+    })
+
+  mockAgent
+    .intercept({
+      method: 'POST',
+      path: '/reg',
+    })
+    .reply(201, {
+      client_id: 'foo',
+      client_secret: 'bar',
+      client_secret_expires_at: 0,
+    })
+
+  const config = await client.dynamicClientRegistration(issuer, {}, undefined, {
+    // @ts-ignore
+    [client.customFetch](url, options) {
+      return undici.fetch(url, { ...options, dispatcher: agent })
+    },
+  })
+
+  mockAgent
+    .intercept({
+      method: 'POST',
+      path: '/token',
+      body(body) {
+        const params = new URLSearchParams(body)
+        assert.strictEqual(params.has('client_id'), true)
+        assert.strictEqual(params.has('client_secret'), true)
+        return true
+      },
+    })
+    .reply(200, {
+      access_token: 'token',
+      token_type: 'bearer',
+    })
+    .times(2)
+
+  await client.clientCredentialsGrant(config)
+  await client.clientCredentialsGrant(config)
+
+  assert.doesNotThrow(() => agent.assertNoPendingInterceptors())
+})
+
+test('DCR uses none by default when client_secret was not returned', async () => {
+  let agent = new undici.MockAgent()
+  agent.disableNetConnect()
+
+  const issuer = new URL('https://op.example.com')
+
+  const mockAgent = agent.get(issuer.origin)
+
+  mockAgent
+    .intercept({
+      method: 'GET',
+      path: '/.well-known/openid-configuration',
+    })
+    .reply(200, {
+      issuer: issuer.href,
+      registration_endpoint: `${issuer.origin}/reg`,
+      token_endpoint: `${issuer.origin}/token`,
+    })
+
+  mockAgent
+    .intercept({
+      method: 'POST',
+      path: '/reg',
+    })
+    .reply(201, {
+      client_id: 'foo',
+    })
+
+  const config = await client.dynamicClientRegistration(issuer, {}, undefined, {
+    // @ts-ignore
+    [client.customFetch](url, options) {
+      return undici.fetch(url, { ...options, dispatcher: agent })
+    },
+  })
+
+  mockAgent
+    .intercept({
+      method: 'POST',
+      path: '/token',
+      body(body) {
+        const params = new URLSearchParams(body)
+        assert.strictEqual(params.has('client_id'), true)
+        return true
+      },
+    })
+    .reply(200, {
+      access_token: 'token',
+      token_type: 'bearer',
+    })
+    .times(2)
+
+  await client.clientCredentialsGrant(config)
+  await client.clientCredentialsGrant(config)
+
+  assert.doesNotThrow(() => agent.assertNoPendingInterceptors())
+})
+
+test('DCR can use ClientSecretBasic without having a secret at hand prior to the registration', async () => {
+  let agent = new undici.MockAgent()
+  agent.disableNetConnect()
+
+  const issuer = new URL('https://op.example.com')
+
+  const mockAgent = agent.get(issuer.origin)
+
+  mockAgent
+    .intercept({
+      method: 'GET',
+      path: '/.well-known/openid-configuration',
+    })
+    .reply(200, {
+      issuer: issuer.href,
+      registration_endpoint: `${issuer.origin}/reg`,
+      token_endpoint: `${issuer.origin}/token`,
+    })
+
+  mockAgent
+    .intercept({
+      method: 'POST',
+      path: '/reg',
+    })
+    .reply(201, {
+      client_id: 'foo',
+      client_secret: 'bar',
+      client_secret_expires_at: 0,
+    })
+
+  const config = await client.dynamicClientRegistration(
+    issuer,
+    {},
+    client.ClientSecretBasic(),
+    {
+      // @ts-ignore
+      [client.customFetch](url, options) {
+        return undici.fetch(url, { ...options, dispatcher: agent })
+      },
+    },
+  )
+
+  mockAgent
+    .intercept({
+      method: 'POST',
+      path: '/token',
+      headers(headers) {
+        return headers.authorization === 'Basic Zm9vOmJhcg=='
+      },
+    })
+    .reply(200, {
+      access_token: 'token',
+      token_type: 'bearer',
+    })
+    .times(2)
+
+  await client.clientCredentialsGrant(config)
+  await client.clientCredentialsGrant(config)
+
+  assert.doesNotThrow(() => agent.assertNoPendingInterceptors())
+})
+
+test('DCR can use ClientSecretPost without having a secret at hand prior to the registration', async () => {
+  let agent = new undici.MockAgent()
+  agent.disableNetConnect()
+
+  const issuer = new URL('https://op.example.com')
+
+  const mockAgent = agent.get(issuer.origin)
+
+  mockAgent
+    .intercept({
+      method: 'GET',
+      path: '/.well-known/openid-configuration',
+    })
+    .reply(200, {
+      issuer: issuer.href,
+      registration_endpoint: `${issuer.origin}/reg`,
+      token_endpoint: `${issuer.origin}/token`,
+    })
+
+  mockAgent
+    .intercept({
+      method: 'POST',
+      path: '/reg',
+    })
+    .reply(201, {
+      client_id: 'foo',
+      client_secret: 'bar',
+      client_secret_expires_at: 0,
+    })
+
+  const config = await client.dynamicClientRegistration(
+    issuer,
+    {},
+    client.ClientSecretPost(),
+    {
+      // @ts-ignore
+      [client.customFetch](url, options) {
+        return undici.fetch(url, { ...options, dispatcher: agent })
+      },
+    },
+  )
+
+  mockAgent
+    .intercept({
+      method: 'POST',
+      path: '/token',
+      body(body) {
+        const params = new URLSearchParams(body)
+        assert.strictEqual(params.has('client_id'), true)
+        assert.strictEqual(params.has('client_secret'), true)
+        return true
+      },
+    })
+    .reply(200, {
+      access_token: 'token',
+      token_type: 'bearer',
+    })
+    .times(2)
+
+  await client.clientCredentialsGrant(config)
+  await client.clientCredentialsGrant(config)
+
+  assert.doesNotThrow(() => agent.assertNoPendingInterceptors())
+})
+
+test('DCR can use ClientSecretJwt without having a secret at hand prior to the registration', async () => {
+  let agent = new undici.MockAgent()
+  agent.disableNetConnect()
+
+  const issuer = new URL('https://op.example.com')
+
+  const mockAgent = agent.get(issuer.origin)
+
+  mockAgent
+    .intercept({
+      method: 'GET',
+      path: '/.well-known/openid-configuration',
+    })
+    .reply(200, {
+      issuer: issuer.href,
+      registration_endpoint: `${issuer.origin}/reg`,
+      token_endpoint: `${issuer.origin}/token`,
+    })
+
+  mockAgent
+    .intercept({
+      method: 'POST',
+      path: '/reg',
+    })
+    .reply(201, {
+      client_id: 'foo',
+      client_secret: 'bar',
+      client_secret_expires_at: 0,
+    })
+
+  const config = await client.dynamicClientRegistration(
+    issuer,
+    {},
+    client.ClientSecretJwt(),
+    {
+      // @ts-ignore
+      [client.customFetch](url, options) {
+        return undici.fetch(url, { ...options, dispatcher: agent })
+      },
+    },
+  )
+
+  mockAgent
+    .intercept({
+      method: 'POST',
+      path: '/token',
+      body(body) {
+        const params = new URLSearchParams(body)
+        assert.strictEqual(params.has('client_id'), true)
+        assert.strictEqual(params.has('client_assertion_type'), true)
+        assert.strictEqual(params.has('client_assertion'), true)
+        return true
+      },
+    })
+    .reply(200, {
+      access_token: 'token',
+      token_type: 'bearer',
+    })
+    .times(2)
+
+  await client.clientCredentialsGrant(config)
+  await client.clientCredentialsGrant(config)
+
+  assert.doesNotThrow(() => agent.assertNoPendingInterceptors())
+})

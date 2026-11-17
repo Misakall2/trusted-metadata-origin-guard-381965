@@ -1,0 +1,17 @@
+{
+    "$schema": "https://jsr.io/schema/config-file.v1.json",
+    "name": "@panva/openid-client",
+    "version": "6.9.0",
+    "exports": "./src/index.ts",
+    "publish": {
+        "include": [
+            "LICENSE.md",
+            "README.md",
+            "src/index.ts"
+        ]
+    },
+    "imports": {
+        "jose": "jsr:@panva/jose@^6.2.15",
+        "oauth4webapi": "jsr:@panva/oauth4webapi@^3.8.8"
+    }
+}
