@@ -1454,24 +1454,53 @@ async function performDiscovery(
       // @ts-expect-error
       oauth.processDiscoveryResponse(oauth._nodiscoverycheck, response),
     )
-    .catch(errorHandler)
-
-  if (resolve && new URL(as.issuer).href !== server.href) {
-    handleEntraId(server, as, options) ||
-      handleB2Clogin(server, options) ||
-      (() => {
+    .catch((err) => {
+      if (
+        resolve &&
+        err instanceof oauth.OperationProcessingError &&
+        err.code === oauth.INVALID_RESPONSE
+      ) {
+        // processDiscoveryResponse only emits INVALID_RESPONSE when the
+        // metadata "issuer" property is missing or not a string
         throw new ClientError(
-          'discovered metadata issuer does not match the expected issuer',
+          'discovered metadata is missing the "issuer" property',
           {
-            code: oauth.JSON_ATTRIBUTE_COMPARISON,
-            cause: {
-              expected: server.href,
-              body: as,
-              attribute: 'issuer',
-            },
+            code: oauth.MISSING_SERVER_METADATA,
+            cause: { attribute: 'issuer' },
           },
         )
-      })()
+      }
+      throw err
+    })
+    .catch(errorHandler)
+
+  if (resolve) {
+    let discovered: URL
+    try {
+      discovered = new URL(as.issuer)
+    } catch {
+      throw new ClientError('discovered metadata "issuer" is not a valid URL', {
+        code: oauth.INVALID_SERVER_METADATA,
+        cause: { attribute: 'issuer' },
+      })
+    }
+
+    if (discovered.href !== server.href) {
+      handleEntraId(server, as, options) ||
+        handleB2Clogin(server, options) ||
+        (() => {
+          throw new ClientError(
+            'discovered metadata issuer does not match the expected issuer',
+            {
+              code: oauth.JSON_ATTRIBUTE_COMPARISON,
+              cause: {
+                expected: server.href,
+                attribute: 'issuer',
+              },
+            },
+          )
+        })()
+    }
   }
 
   return as
